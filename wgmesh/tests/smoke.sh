@@ -56,11 +56,15 @@ cat > "$TMP/bin/systemctl" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >> "$WGMESH_TEST_SYSTEMCTL_LOG"
 case "$1" in
+    is-active)
+        [ "$2" = --quiet ] || exit 2
+        [ -f "$WGMESH_TEST_SYSTEM_ACTIVE" ]
+        ;;
     enable) touch "$WGMESH_TEST_SYSTEM_ENABLED" ;;
-    restart) touch "$WGMESH_TEST_ACTIVE" ;;
+    restart) touch "$WGMESH_TEST_ACTIVE" "$WGMESH_TEST_SYSTEM_ACTIVE" ;;
     disable)
         [ "$2" = --now ] || exit 2
-        rm -f "$WGMESH_TEST_SYSTEM_ENABLED"
+        rm -f "$WGMESH_TEST_SYSTEM_ENABLED" "$WGMESH_TEST_SYSTEM_ACTIVE"
         ;;
     *) exit 2 ;;
 esac
@@ -106,6 +110,30 @@ cat > "$TMP/bin/netstat" <<'EOF'
 cat "$WGMESH_TEST_NETSTAT"
 EOF
 
+cat > "$TMP/bin/sysctl" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$*" >> "$WGMESH_TEST_SYSCTL_LOG"
+case "$1:$2" in
+    -w:net.ipv4.ip_forward=1)
+        printf '1\n' > "$WGMESH_TEST_SYSCTL_LINUX_STATE"
+        ;;
+    -w:net.inet.ip.forwarding=1)
+        printf '1\n' > "$WGMESH_TEST_SYSCTL_MACOS_STATE"
+        ;;
+    -n:net.ipv4.ip_forward)
+        [ -f "$WGMESH_TEST_SYSCTL_LINUX_STATE" ] || exit 1
+        printf '1\n'
+        ;;
+    -n:net.inet.ip.forwarding)
+        [ -f "$WGMESH_TEST_SYSCTL_MACOS_STATE" ] || exit 1
+        printf '1\n'
+        ;;
+    *)
+        exit 2
+        ;;
+esac
+EOF
+
 cat > "$TMP/ip.routes" <<'EOF'
 default via 192.0.2.1 dev eth0
 192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.10
@@ -138,6 +166,7 @@ EOF
 chmod 700 "$TMP/bin/wg" "$TMP/bin/wg-quick" "$TMP/bin/wireguard-go" \
     "$TMP/bin/systemctl" "$TMP/bin/launchctl" "$TMP/bin/ip" \
     "$TMP/bin/ifconfig" "$TMP/bin/netstat" \
+    "$TMP/bin/sysctl" \
     "$TMP/platform/darwin/uname" "$TMP/platform/linux/uname"
 
 run() {
@@ -153,12 +182,17 @@ run() {
     WGMESH_IP="$TMP/bin/ip" \
     WGMESH_IFCONFIG="$TMP/bin/ifconfig" \
     WGMESH_NETSTAT="$TMP/bin/netstat" \
+    WGMESH_SYSCTL="$TMP/bin/sysctl" \
     WGMESH_TEST_IP_ROUTES="$TMP/ip.routes" \
     WGMESH_TEST_IP_ADDRS="$TMP/ip.addrs" \
     WGMESH_TEST_IFCONFIG="$TMP/ifconfig.txt" \
     WGMESH_TEST_NETSTAT="$TMP/netstat.txt" \
+    WGMESH_TEST_SYSCTL_LOG="$TMP/sysctl.log" \
+    WGMESH_TEST_SYSCTL_LINUX_STATE="$TMP/sysctl-linux.state" \
+    WGMESH_TEST_SYSCTL_MACOS_STATE="$TMP/sysctl-macos.state" \
     WGMESH_TEST_ACTIVE="$TMP/active" \
     WGMESH_TEST_SYSTEM_ENABLED="$TMP/system-enabled" \
+    WGMESH_TEST_SYSTEM_ACTIVE="$TMP/system-active" \
     WGMESH_TEST_SYSTEMCTL_LOG="$TMP/systemctl.log" \
     WGMESH_LAUNCHD_ROOT="$TMP/launchd" \
     WGMESH_TEST_LAUNCHD_ENABLED="$TMP/launchd-enabled" \
@@ -199,6 +233,12 @@ expect_contains "$route_conflict_output" 'overlaps existing local route'
 host_output=$(run host init $host_args)
 expect_contains "$host_output" 'hub_public_key=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB='
 expect_contains "$host_output" 'result=CREATED'
+expect_contains "$host_output" 'interface_state=ACTIVE'
+if [ "$(grep -c '^PostUp = .*net\.inet\.ip\.forwarding=1$' "$TMP/config/wgmesh-demo.conf")" -ne 1 ] ||
+    ! grep -q -- '-w net.inet.ip.forwarding=1' "$TMP/sysctl.log"; then
+    printf 'macOS Hub forwarding was not configured exactly once\n' >&2
+    exit 1
+fi
 
 new_option_output=$(run host init --network-name canonical-name --node-id hub \
     --transport tailscale --overlay-cidr 10.253.0.0/24 \
@@ -265,6 +305,9 @@ if [ ! -f "$TMP/active" ] || [ ! -f "$TMP/launchd-enabled" ] ||
     printf 'repeated macOS host init did not restore its interface or LaunchDaemon\n' >&2
     exit 1
 fi
+launchd_status=$(run status --network-name darwin-auto --json)
+expect_contains "$launchd_status" '"autostart":true'
+expect_contains "$launchd_status" '"service_state":"ACTIVE"'
 launchd_uninstall=$(run host uninstall --network-name darwin-auto)
 expect_contains "$launchd_uninstall" 'state=ABSENT'
 host_output=$(run host init $host_args)
@@ -292,9 +335,14 @@ if [ ! -f "$TMP/state/demo/peers/node-a.state" ] ||
     printf 'adding a second peer did not preserve both peer state files\n' >&2
     exit 1
 fi
+if [ "$(grep -c '^PostUp = .*net\.inet\.ip\.forwarding=1$' "$TMP/config/wgmesh-demo.conf")" -ne 1 ]; then
+    printf 'adding Hub peers duplicated the macOS forwarding hook\n' >&2
+    exit 1
+fi
 
 status_output=$(run status --network-name demo --json)
 expect_contains "$status_output" '"state":"ACTIVE"'
+expect_contains "$status_output" '"service_state":"INACTIVE"'
 expect_contains "$status_output" '"peer_count":2'
 
 remove_output=$(run host remove-node --network-name demo --node-id node-a)
@@ -307,6 +355,13 @@ node_output=$(run node join --network-name demo --node-id node-a --transport pub
     --hub-endpoint 203.0.113.20:51820 \
     --hub-public-key CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC= --no-autostart)
 expect_contains "$node_output" 'node_public_key=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB='
+expect_contains "$node_output" 'interface_state=ACTIVE'
+if [ "$(grep -c '^\[Peer\]$' "$TMP/config/wgmesh-demo.conf")" -ne 1 ] ||
+    grep -q '^PostUp = ' "$TMP/config/wgmesh-demo.conf" ||
+    ! grep -q '^AllowedIPs = 10\.250\.0\.0/24$' "$TMP/config/wgmesh-demo.conf"; then
+    printf 'Node config does not contain exactly one Hub peer without forwarding hook\n' >&2
+    exit 1
+fi
 
 if run node uninstall --network-name demo --node-id wrong-node >/dev/null 2>&1; then
     printf 'uninstall accepted a mismatched node-id\n' >&2
@@ -331,11 +386,32 @@ linux_output=$(run host init --network-name linux-demo --node-id hub \
     --transport public --overlay-cidr 10.252.0.0/24 \
     --address 10.252.0.1/24 --endpoint 203.0.113.20:51820)
 expect_contains "$linux_output" 'result=CREATED'
+expect_contains "$linux_output" 'interface_state=ACTIVE'
+linux_status=$(run status --network-name linux-demo --json)
+expect_contains "$linux_status" '"autostart":true'
+expect_contains "$linux_status" '"state":"ACTIVE"'
+expect_contains "$linux_status" '"service_state":"INACTIVE"'
+linux_status_text=$(run status --network-name linux-demo)
+expect_contains "$linux_status_text" 'autostart=enabled'
+expect_contains "$linux_status_text" 'state=ACTIVE'
+expect_contains "$linux_status_text" 'service_state=INACTIVE'
+linux_config=
+for candidate in "$TMP/config"/*.conf; do
+    [ -f "$candidate" ] || continue
+    linux_config=$candidate
+done
+if [ -z "$linux_config" ] ||
+    [ "$(grep -c '^PostUp = .*net\.ipv4\.ip_forward=1$' "$linux_config")" -ne 1 ] ||
+    ! grep -q -- '-w net.ipv4.ip_forward=1' "$TMP/sysctl.log"; then
+    printf 'Linux Hub forwarding was not configured exactly once\n' >&2
+    exit 1
+fi
 rm -f "$TMP/active" "$TMP/system-enabled"
 linux_output=$(run host init --network-name linux-demo --node-id hub \
     --transport public --overlay-cidr 10.252.0.0/24 \
     --address 10.252.0.1/24 --endpoint 203.0.113.20:51820)
 expect_contains "$linux_output" 'result=NOOP'
+expect_contains "$linux_output" 'interface_state=ACTIVE'
 if [ ! -f "$TMP/active" ] || [ ! -f "$TMP/system-enabled" ]; then
     printf 'repeated Linux host init did not restore the interface and autostart\n' >&2
     exit 1

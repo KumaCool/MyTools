@@ -42,6 +42,7 @@ BREW=${WGMESH_BREW:-}
 IP=${WGMESH_IP:-}
 IFCONFIG=${WGMESH_IFCONFIG:-}
 NETSTAT=${WGMESH_NETSTAT:-}
+SYSCTL=${WGMESH_SYSCTL:-}
 
 NETWORK=
 NODE_ID=
@@ -56,6 +57,7 @@ NO_AUTOSTART=0
 JSON_OUTPUT=0
 SEEN_OPTIONS=
 HOST_ADDRESS=
+HOST_FORWARDING_KEY=
 
 ROLE=
 STATE_FILE=
@@ -234,6 +236,36 @@ load_tools() {
             [ -n "$LAUNCHCTL" ] || die "required command not found: launchctl"
         fi
     fi
+}
+
+load_host_forwarding_tool() {
+    case "$PLATFORM" in
+        linux)
+            HOST_FORWARDING_KEY=net.ipv4.ip_forward
+            ;;
+        macos)
+            HOST_FORWARDING_KEY=net.inet.ip.forwarding
+            ;;
+        *)
+            die "unsupported platform for Hub forwarding: $PLATFORM"
+            ;;
+    esac
+    SYSCTL=$(command_path "$SYSCTL" sysctl)
+    [ -n "$SYSCTL" ] ||
+        die "required command not found: sysctl (needed for Hub overlay forwarding)"
+}
+
+ensure_host_forwarding() {
+    [ -n "$SYSCTL" ] && [ -n "$HOST_FORWARDING_KEY" ] ||
+        load_host_forwarding_tool
+    forwarding_value=$("$SYSCTL" -n "$HOST_FORWARDING_KEY" 2>/dev/null) || forwarding_value=
+    if [ "$forwarding_value" != 1 ]; then
+        "$SYSCTL" -w "$HOST_FORWARDING_KEY=1" >/dev/null 2>&1 ||
+            return 1
+        forwarding_value=$("$SYSCTL" -n "$HOST_FORWARDING_KEY" 2>/dev/null) ||
+            return 1
+    fi
+    [ "$forwarding_value" = 1 ]
 }
 
 validate_id() {
@@ -728,6 +760,7 @@ write_host_config() {
     read_private_key
     temp="${target}.tmp.$$"
     rm -f "$temp"
+    [ -n "$SYSCTL" ] && [ -n "$HOST_FORWARDING_KEY" ] || return 1
     {
         printf '# wgmesh-managed=true\n'
         printf '# wgmesh-network=%s\n' "$NETWORK"
@@ -735,6 +768,7 @@ write_host_config() {
         printf 'PrivateKey = %s\n' "$PRIVATE_KEY"
         printf 'Address = %s\n' "${HOST_ADDRESS:-$ADDRESS}"
         printf 'ListenPort = %s\n' "$LISTEN_PORT"
+        printf 'PostUp = %s -w %s=1\n' "$SYSCTL" "$HOST_FORWARDING_KEY"
         for peer_file in "$NETWORK_DIR"/peers/*.state; do
             [ -f "$peer_file" ] || continue
             load_peer_state "$peer_file" || return 1
@@ -753,6 +787,20 @@ write_host_config() {
         return 1
     }
     return 0
+}
+
+ensure_host_forwarding_hook() {
+    expected="PostUp = $SYSCTL -w $HOST_FORWARDING_KEY=1"
+    grep -Fqx "$expected" "$CONFIG_PATH" 2>/dev/null && return 0
+    temp_config="${CONFIG_PATH}.tmp.$$"
+    if ! write_host_config "$temp_config" ''; then
+        rm -f "$temp_config"
+        die "cannot add Hub forwarding hook to config"
+    fi
+    mv "$temp_config" "$CONFIG_PATH" || {
+        rm -f "$temp_config"
+        die "cannot update Hub forwarding hook in config"
+    }
 }
 
 write_node_config() {
@@ -985,7 +1033,7 @@ print_install_result() {
     else
         printf 'autostart=disabled\n'
     fi
-    printf 'state=CONFIGURED\n'
+    printf 'interface_state=%s\n' "$(state_is_active "$INTERFACE")"
 }
 
 host_init() {
@@ -1004,6 +1052,7 @@ host_init() {
     validate_address_in_overlay "$OVERLAY_CIDR" "$ADDRESS"
     parse_endpoint "$ENDPOINT"
     load_tools "$([ "$NO_AUTOSTART" = 1 ] && printf noautostart || printf autostart)"
+    load_host_forwarding_tool
 
     INTERFACE=$(interface_for_network "$NETWORK")
     NETWORK_DIR=$(network_dir_for "$NETWORK")
@@ -1023,7 +1072,10 @@ host_init() {
             "$requested_transport" "$requested_overlay_cidr" \
             "$requested_address" "$requested_endpoint" "$requested_autostart"; then
             assert_managed_config "$CONFIG_PATH"
+            ensure_host_forwarding_hook
             restore_existing_install
+            ensure_host_forwarding ||
+                die "cannot enable Hub IPv4 forwarding with sysctl"
             print_install_result
             printf 'result=NOOP\n'
             return 0
@@ -1049,6 +1101,10 @@ host_init() {
         rm -f "$CONFIG_PATH" "$PRIVATE_KEY_PATH"
         die "host initialization failed"
     }
+    if ! ensure_host_forwarding; then
+        cleanup_new_install
+        die "cannot enable Hub IPv4 forwarding with sysctl"
+    fi
     if [ "$STATE_AUTOSTART" = 1 ]; then
         enable_autostart || {
             cleanup_new_install
@@ -1154,6 +1210,8 @@ load_host_or_die() {
     PRIVATE_KEY_PATH=${PRIVATE_KEY_PATH:-$(private_key_path_for "$NETWORK")}
     SERVICE_PATH=${SERVICE_PATH:-$(service_path_for "$INTERFACE")}
     HOST_ADDRESS=$ADDRESS
+    parse_endpoint "$ENDPOINT"
+    LISTEN_PORT=$ENDPOINT_PORT
     assert_managed_config "$CONFIG_PATH"
 }
 
@@ -1178,6 +1236,7 @@ host_add_node() {
     NODE_PUBLIC_KEY=$requested_node_public_key
     validate_address_in_overlay "$OVERLAY_CIDR" "$ADDRESS"
     load_tools noautostart
+    load_host_forwarding_tool
 
     peer_file="$NETWORK_DIR/peers/$NODE_ID.state"
     if [ -f "$peer_file" ]; then
@@ -1253,6 +1312,7 @@ host_remove_node() {
     NETWORK=$requested_network
     NODE_ID=$requested_node_id
     load_tools noautostart
+    load_host_forwarding_tool
     peer_file="$NETWORK_DIR/peers/$NODE_ID.state"
     [ -f "$peer_file" ] || {
         printf 'network_id=%s\nnode_id=%s\npeer_revoked=none\nstate=CONFIGURED\nresult=NOOP\n' \
@@ -1340,6 +1400,40 @@ state_is_active() {
     fi
 }
 
+service_is_active() {
+    case "$PLATFORM" in
+        linux)
+            SYSTEMCTL=$(command_path "$SYSTEMCTL" systemctl)
+            [ -n "$SYSTEMCTL" ] || {
+                printf UNKNOWN
+                return 0
+            }
+            if "$SYSTEMCTL" is-active --quiet "wg-quick@$INTERFACE.service" \
+                >/dev/null 2>&1; then
+                printf ACTIVE
+            else
+                printf INACTIVE
+            fi
+            ;;
+        macos)
+            LAUNCHCTL=$(command_path "$LAUNCHCTL" launchctl)
+            [ -n "$LAUNCHCTL" ] || {
+                printf UNKNOWN
+                return 0
+            }
+            if "$LAUNCHCTL" print "system/com.wgmesh.$INTERFACE" \
+                >/dev/null 2>&1; then
+                printf ACTIVE
+            else
+                printf INACTIVE
+            fi
+            ;;
+        *)
+            printf UNKNOWN
+            ;;
+    esac
+}
+
 latest_handshake() {
     "$WG" show "$1" latest-handshakes 2>/dev/null |
         awk '$2 ~ /^[0-9]+$/ && $2 > latest { latest = $2 }
@@ -1375,6 +1469,7 @@ print_status_one() {
     fi
     [ -n "$WG" ] || die "required command not found: wg"
     current_state=$(state_is_active "$INTERFACE")
+    current_service_state=$(service_is_active)
     handshake=$(latest_handshake "$INTERFACE")
     if [ "$JSON_OUTPUT" = 1 ]; then
         if [ "$ROLE" = host ]; then
@@ -1386,6 +1481,7 @@ print_status_one() {
             printf '"interface":%s,' "$(json_quote "$INTERFACE")"
             printf '"address":%s,' "$(json_quote "$ADDRESS")"
             printf '"autostart":%s,' "$([ "$STATE_AUTOSTART" = 1 ] && printf true || printf false)"
+            printf '"service_state":%s,' "$(json_quote "$current_service_state")"
             printf '"state":%s,' "$(json_quote "$current_state")"
             printf '"handshake":%s,' "${handshake:-null}"
             printf '"hub_public_key":%s,' "$(json_quote "$PUBLIC_KEY")"
@@ -1400,6 +1496,7 @@ print_status_one() {
             printf '"interface":%s,' "$(json_quote "$INTERFACE")"
             printf '"address":%s,' "$(json_quote "$ADDRESS")"
             printf '"autostart":%s,' "$([ "$STATE_AUTOSTART" = 1 ] && printf true || printf false)"
+            printf '"service_state":%s,' "$(json_quote "$current_service_state")"
             printf '"state":%s,' "$(json_quote "$current_state")"
             printf '"handshake":%s,' "${handshake:-null}"
             printf '"node_public_key":%s,' "$(json_quote "$PUBLIC_KEY")"
@@ -1414,6 +1511,7 @@ print_status_one() {
         printf 'interface=%s\n' "$INTERFACE"
         printf 'address=%s\n' "$ADDRESS"
         printf 'autostart=%s\n' "$([ "$STATE_AUTOSTART" = 1 ] && printf enabled || printf disabled)"
+        printf 'service_state=%s\n' "$current_service_state"
         printf 'state=%s\n' "$current_state"
         printf 'handshake=%s\n' "${handshake:-none}"
         if [ "$ROLE" = host ]; then

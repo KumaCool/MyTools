@@ -76,6 +76,17 @@ function Assert-Tools([string[]]$Names) {
     }
 }
 
+function Assert-HostForwardingTools {
+    $setCommand = Get-Command "Set-NetIPInterface" -ErrorAction SilentlyContinue
+    $getCommand = Get-Command "Get-NetIPInterface" -ErrorAction SilentlyContinue
+    if ($null -eq $setCommand -or $null -eq $getCommand) {
+        Fail "Hub forwarding requires Set-NetIPInterface and Get-NetIPInterface"
+    }
+    if (-not $setCommand.Parameters.ContainsKey("PolicyStore")) {
+        Fail "Hub forwarding requires Set-NetIPInterface PolicyStore support"
+    }
+}
+
 function Test-ToolAvailable([string]$Name) {
     try {
         [void](Get-ToolPath $Name)
@@ -589,6 +600,54 @@ function Ensure-TunnelService([hashtable]$State, [string]$ConfigPath, [bool]$Sta
     return $created
 }
 
+function Ensure-HostForwarding([hashtable]$State) {
+    if ($State.role -ne "host") {
+        return
+    }
+    Assert-HostForwardingTools
+    $interfaces = @()
+    for ($attempt = 0; $attempt -lt 20; $attempt++) {
+        try {
+            $interfaces = @(Get-NetIPInterface `
+                -InterfaceAlias $State.interface `
+                -AddressFamily IPv4 `
+                -ErrorAction Stop)
+        } catch {
+            $interfaces = @()
+        }
+        if ($interfaces.Count -gt 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($interfaces.Count -eq 0) {
+        Fail "WireGuard Hub interface '$($State.interface)' was not found for IPv4 forwarding"
+    }
+
+    try {
+        Set-NetIPInterface `
+            -InterfaceAlias $State.interface `
+            -AddressFamily IPv4 `
+            -Forwarding Enabled `
+            -PolicyStore PersistentStore `
+            -ErrorAction Stop
+    } catch {
+        Fail "cannot enable IPv4 forwarding on Hub interface '$($State.interface)': $($_.Exception.Message)"
+    }
+
+    try {
+        $interfaces = @(Get-NetIPInterface `
+            -InterfaceAlias $State.interface `
+            -AddressFamily IPv4 `
+            -ErrorAction Stop)
+    } catch {
+        Fail "cannot verify IPv4 forwarding on Hub interface '$($State.interface)': $($_.Exception.Message)"
+    }
+    if (@($interfaces | Where-Object { [string]$_.Forwarding -eq "Enabled" }).Count -eq 0) {
+        Fail "IPv4 forwarding is not enabled on Hub interface '$($State.interface)'"
+    }
+}
+
 function Remove-TunnelService([string]$Interface, [string]$ConfigPath) {
     $service = Get-ServiceName $Interface
     if (Get-ServiceExists $service) {
@@ -698,7 +757,7 @@ function Write-InstallOutput([hashtable]$State, [string]$StateName) {
         "interface=$($State.interface)",
         "address=$($State.address)",
         "autostart=$(if ($State.autostart -eq 'true') { 'enabled' } else { 'disabled' })",
-        "state=CONFIGURED",
+        "interface_state=$(if (Test-TunnelActive $State.interface) { 'ACTIVE' } else { 'CONFIGURED' })",
         "result=$(if ($StateName -eq 'NOOP') { 'NOOP' } else { 'CREATED' })"
     )
     if ($State.role -eq "host") {
@@ -777,6 +836,9 @@ function Get-NodeStateRequest([hashtable]$Options) {
 function Install-LocalNetwork([hashtable]$Requested) {
     Assert-Administrator
     Ensure-Tools @("wg.exe", "wireguard.exe", "sc.exe")
+    if ($Requested.role -eq "host") {
+        Assert-HostForwardingTools
+    }
     Ensure-Storage
 
     $paths = Get-NetworkPaths $Requested.network_id
@@ -793,7 +855,11 @@ function Install-LocalNetwork([hashtable]$Requested) {
             Fail "network '$($Requested.network_id)' is already configured with different parameters"
         }
         Assert-ManagedConfig $paths.ConfigPath $Requested.network_id
-        [void](Ensure-TunnelService $existingState $paths.ConfigPath $false)
+        $startExisting = $Requested.role -eq "host" -and $existingState.autostart -eq "true"
+        [void](Ensure-TunnelService $existingState $paths.ConfigPath $startExisting)
+        if ($Requested.role -eq "host" -and (Test-TunnelActive $existingState.interface)) {
+            Ensure-HostForwarding $existingState
+        }
         $Requested.public_key = $existingState.public_key
         return @{
             State  = $Requested
@@ -820,6 +886,9 @@ function Install-LocalNetwork([hashtable]$Requested) {
         Write-KeyValueFile $paths.StatePath $Requested
         Write-Peers $paths.PeersPath $peers
         $createdService = Ensure-TunnelService $Requested $paths.ConfigPath $true
+        if ($Requested.role -eq "host") {
+            Ensure-HostForwarding $Requested
+        }
     } catch {
         if ($createdService) {
             [void](Invoke-Tool "wireguard.exe" @("/uninstalltunnelservice", $Requested.interface) -AllowFailure)
@@ -867,10 +936,16 @@ function Commit-HostPeers($Loaded, [object[]]$OldPeers, [object[]]$NewPeers) {
     $privateKey = Get-ConfigPrivateKey $configPath
     $shouldRun = Test-TunnelActive $Loaded.Values.interface
     try {
+        if ($shouldRun) {
+            Assert-HostForwardingTools
+        }
         $newConfig = New-ConfigText $Loaded.Values $privateKey $NewPeers
         Write-Config $configPath $newConfig
         Write-Peers $Loaded.Paths.PeersPath $NewPeers
         Refresh-TunnelService $Loaded.Values $configPath $shouldRun
+        if ($shouldRun) {
+            Ensure-HostForwarding $Loaded.Values
+        }
     } catch {
         $failure = $_
         $rollbackFailures = New-Object Collections.Generic.List[string]
@@ -886,6 +961,9 @@ function Commit-HostPeers($Loaded, [object[]]$OldPeers, [object[]]$NewPeers) {
         }
         try {
             Refresh-TunnelService $Loaded.Values $configPath $shouldRun
+            if ($shouldRun) {
+                Ensure-HostForwarding $Loaded.Values
+            }
         } catch {
             [void]$rollbackFailures.Add("tunnel service rollback failed")
         }
@@ -1022,6 +1100,21 @@ function Get-Handshake([string]$Interface) {
     return $latest
 }
 
+function Get-ServiceState([string]$Interface) {
+    $service = Get-Service -Name (Get-ServiceName $Interface) -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        return "ABSENT"
+    }
+    switch ($service.Status.ToString()) {
+        "Running" { return "ACTIVE" }
+        "Stopped" { return "INACTIVE" }
+        "StartPending" { return "STARTING" }
+        "StopPending" { return "STOPPING" }
+        "Paused" { return "PAUSED" }
+        default { return "UNKNOWN" }
+    }
+}
+
 function Get-StatusRecord($loaded) {
     $state = $loaded.Values
     $active = (Invoke-Tool "wg.exe" @("show", $state.interface) -AllowFailure).ExitCode -eq 0
@@ -1033,6 +1126,7 @@ function Get-StatusRecord($loaded) {
         interface = $state.interface
         address = $state.address
         autostart = ($state.autostart -eq "true")
+        service_state = Get-ServiceState $state.interface
         state = if ($active) { "ACTIVE" } else { "CONFIGURED" }
         handshake = Get-Handshake $state.interface
     }

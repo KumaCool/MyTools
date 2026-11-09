@@ -20,8 +20,11 @@
 - Hub 使用 `host remove-node` 在 Hub 本机撤销节点 peer。
 - 支持安装时选择 `tailscale` 或 `public` endpoint。
 - Hub 和节点分别在本机生成私钥，只通过命令参数交换公开密钥。
-- Hub 与节点之间的 WireGuard overlay 通信属于首版范围。
-- 不实现节点之间经 Hub 转发、`member_routes`、LAN 路由、full-tunnel、full-mesh 或现有地址透明转发。
+- 节点之间的 WireGuard overlay 通信经 Hub 转发，数据路径为
+  `Node A → Hub → Node B`。
+- Linux、macOS、Windows 都可以作为 Hub，也都可以作为 Node。
+- Hub 只转发 overlay 网段；不实现 `member_routes`、LAN 路由、full-tunnel、
+  full-mesh 或现有地址透明转发。
 - 不部署常驻 `wgmesh` 服务，不通过 SSH 远程卸载。
 - 不提供在线踢出通知或公钥自动过期。
 
@@ -31,11 +34,13 @@
 
 | 平台 | 脚本 | 需要的已有组件 |
 | --- | --- | --- |
-| Linux | `wgmesh.sh` | POSIX shell、`wg`、`wg-quick`、`ip`；缺少 WireGuard 工具时使用已有的 `apt-get`、`dnf`、`yum`、`apk` 或 `pacman` 安装；启用开机启动时需要 `systemctl` |
-| macOS | `wgmesh.sh` | POSIX shell、`ifconfig`/`netstat`；缺少 WireGuard 工具时仅在检测到已有 Homebrew 后尝试安装；启用开机启动时需要 `launchctl` |
-| Windows | `wgmesh.ps1` | PowerShell、`sc.exe`、系统自带 `Get-NetIPAddress`/`Get-NetRoute`；缺少 WireGuard 工具时仅在检测到已有 `winget.exe` 后尝试安装 WireGuard for Windows |
+| Linux Hub / Node | `wgmesh.sh` | POSIX shell、`wg`、`wg-quick`、`ip`；Hub 还需要已有 `sysctl`；缺少 WireGuard 工具时使用已有的 `apt-get`、`dnf`、`yum`、`apk` 或 `pacman` 安装；启用开机启动时需要 `systemctl` |
+| macOS Hub / Node | `wgmesh.sh` | POSIX shell、`ifconfig`/`netstat`；Hub 还需要已有 `sysctl`；缺少 WireGuard 工具时仅在检测到已有 Homebrew 后尝试安装；启用开机启动时需要 `launchctl` |
+| Windows Hub / Node | `wgmesh.ps1` | PowerShell、`sc.exe`、系统自带 `Get-NetIPAddress`/`Get-NetRoute`；Hub 还需要 `Set-NetIPInterface` 或等价系统命令；缺少 WireGuard 工具时仅在检测到已有 `winget.exe` 后尝试安装 WireGuard for Windows |
 
-选择 `tailscale` 时，目标机器需要已连通同一 Tailscale 网络；选择 `public` 时，Hub endpoint 需要由公网或 NAT 环境提供可达性。脚本只使用命令中提供的 endpoint，不调用 Tailscale 管理 API。
+选择 `tailscale` 时，目标机器需要已连通同一 Tailscale 网络；选择 `public` 时，Hub endpoint 需要由公网或 NAT 环境提供可达性。脚本只使用命令中提供的 endpoint，不调用 Tailscale 管理 API。relay 计划中的逻辑路径是 `Node → Hub → Node`。
+Hub 所在机器的现有防火墙还必须允许 WireGuard 接口上的 overlay 转发；脚本不安装、
+修改或接管防火墙规则。
 
 macOS 脚本需要命令行中的 `wg`、`wg-quick` 和 `wireguard-go`；仅安装
 WireGuard.app 不保证这些命令已经出现在当前 shell 的 `PATH` 中。Homebrew
@@ -172,7 +177,8 @@ overlay 和公钥填写方式不变。
 
 ### `host init`
 
-在 Hub 本机创建一个网络实例和 WireGuard 接口。
+在当前 Hub 本机创建一个网络实例、WireGuard 接口和仅限 overlay 的
+转发能力。Linux、macOS、Windows 都可以执行 `host init` 作为 Hub。
 
 | 参数 | 含义 |
 | --- | --- |
@@ -187,6 +193,7 @@ overlay 和公钥填写方式不变。
 ### `node join`
 
 在 Node 本机创建一个网络实例。该命令只配置 Node，不会修改 Hub 的 peer 列表。
+Node 只需要 Hub peer，不需要保存其他 Node 的公钥或 endpoint。
 
 | 参数 | 含义 |
 | --- | --- |
@@ -201,7 +208,8 @@ overlay 和公钥填写方式不变。
 
 ### `host add-node`
 
-在 Hub 本机登记一个已经执行过 `node join` 的 Node peer。
+在 Hub 本机登记一个已经执行过 `node join` 的 Node peer。登记后，Hub
+可以把一个 Node 的 overlay 流量转发给另一个已登记 Node。
 
 | 参数 | 含义 |
 | --- | --- |
@@ -220,6 +228,12 @@ overlay 和公钥填写方式不变。
 | `status [--network-name <NETWORK_ID>]` | 查看一个网络或本机全部网络的状态。省略 `--network-name` 时列出全部本机状态。 |
 | `--json` | 仅用于 `status`，将状态输出为 JSON；不能用于安装、登记或卸载命令。 |
 | `--help` / `-h` | 输出命令用法并退出，不修改本机 WireGuard 或 wgmesh 状态。 |
+
+`status` 中的 `autostart` 表示保存的开机启动设置；`state` 表示 WireGuard 接口
+当前是否实际存在（`ACTIVE` 或 `CONFIGURED`）；`service_state` 表示服务管理器报告的
+当前状态。Linux 使用 systemd，macOS 使用 launchd，Windows 使用 WireGuard Tunnel
+Service。Linux/macOS 的服务管理器不可查询时为 `UNKNOWN`；Windows 尚无对应服务时为
+`ABSENT`。安装命令的 `interface_state` 也报告 WireGuard 接口当前状态。
 
 脚本会校验 IPv4 CIDR、endpoint 端口（`1-65535`）和 WireGuard 公钥格式
 （44 字符 Base64 文本）。参数中的私钥不会被接受；两端私钥都由脚本在各自机器上
@@ -243,18 +257,22 @@ host uninstall --network-name <NETWORK_ID>
 
 ## 当前状态
 
-脚本入口已实现；跨平台真实隧道验收仍需在对应目标系统完成：
+脚本入口已实现；基础生命周期和跨平台 Hub relay 的目标机验收状态如下：
 
 1. `wgmesh.sh`：Linux/macOS 的参数解析、配置生成、WireGuard 操作和服务管理。
-2. `wgmesh.ps1`：Windows 的同等命令接口和 WireGuard Tunnel Service 操作。
-3. `tests/smoke.sh`：不接触真实 WireGuard 的 Unix mock 生命周期检查。
+   Hub forwarding 已接入。
+2. `wgmesh.ps1`：Windows Hub/Node 的同等命令接口、WireGuard Tunnel Service
+   操作和 Hub forwarding 接线；PowerShell/Windows 实机检查待完成。
+3. `tests/smoke.sh`：不接触真实 WireGuard 的 Unix mock 生命周期和 Hub
+   forwarding 检查已通过。
 
-首版只保证 Hub↔Node 通信，不实现或验收节点之间经 Hub 转发的 overlay 流量。
+基础 Hub/Node 生命周期和脚本层 forwarding 接线已实现；一次代表性三机
+overlay 连通及必要的目标机恢复检查仍按增量开发计划实施和验收。
 
 ## 文档
 
-- [开发计划](docs/plans/wgmesh-development-plan.md)
-- [脚本版 CLI runbook](docs/plans/wgmesh-cli-example-runbook.md)
+- [01 基础开发计划](docs/plans/01-wgmesh-base-development-plan.md)
+- [02 Hub 中转增量计划](docs/plans/02-wgmesh-hub-relay-plan.md)
 
 ## 支持平台
 
