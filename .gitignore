@@ -1,0 +1,17 @@
+# macOS and Windows metadata
+.DS_Store
+**/.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Local environment and generated output
+.env
+.env.*
+!.env.example
+*.log
+*.tmp
+
+# Editor temporary files
+*.swp
+*.swo
+*~
