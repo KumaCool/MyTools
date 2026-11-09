@@ -9,7 +9,8 @@
   `yum`、`apk` 或 `pacman` 安装 `wireguard-tools`；默认开机启动还需要 `systemctl`。
 - macOS 需要系统自带的 `ifconfig` 和 `netstat`；缺少 `wg`、`wg-quick` 或
   `wireguard-go` 时脚本仅在检测到已有 Homebrew 后尝试安装；默认开机启动还需要
-  `launchctl`。仅安装 WireGuard.app 不足以由脚本管理隧道。
+  `launchctl`。仅安装 WireGuard.app 不保证脚本所需的命令行工具已经出现在当前
+  shell 的 `PATH` 中。
 - Windows 需要 PowerShell、`sc.exe` 以及系统自带的 `Get-NetIPAddress` 和
   `Get-NetRoute`；缺少 WireGuard 工具时脚本仅在检测到已有 `winget.exe` 后尝试
   安装 WireGuard for Windows。

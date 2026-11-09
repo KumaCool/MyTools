@@ -36,11 +36,13 @@
 | macOS | POSIX shell | 系统自带 `ifconfig`/`netstat`；缺少 WireGuard 工具时仅在检测到已有 Homebrew 后尝试安装；默认开机启动需要 `launchctl` |
 | Windows | PowerShell | `sc.exe`，以及系统自带 `Get-NetIPAddress`/`Get-NetRoute`；缺少 WireGuard 工具时仅在检测到已有 `winget.exe` 后尝试安装 WireGuard for Windows |
 
-macOS 单独安装 WireGuard.app 不够；实现调用命令行工具。Homebrew 不是 macOS
-默认组件，没有 Homebrew 时需要先手动安装 WireGuard 命令行工具。Windows 的
-`winget.exe` 也按可选工具处理，没有时需要先手动安装 WireGuard for Windows
-或 App Installer/WinGet。选择 Tailscale transport 时，机器需预先加入同一
-Tailscale 网络。`wgmesh` 不调用 Tailscale 管理接口。
+macOS 端脚本只检查并调用命令行中的 `wg`、`wg-quick` 和 `wireguard-go`。
+仅安装 WireGuard.app 不保证这些命令已经出现在当前 shell 的 `PATH` 中。
+Homebrew 不是 macOS 默认组件，没有 Homebrew 时需要先手动准备 WireGuard
+命令行工具。
+Windows 的 `winget.exe` 也按可选工具处理，没有时需要先手动安装 WireGuard
+for Windows 或 App Installer/WinGet。选择 Tailscale transport 时，机器需预先
+加入同一 Tailscale 网络。`wgmesh` 不调用 Tailscale 管理接口。
 
 ## 命令合同
 

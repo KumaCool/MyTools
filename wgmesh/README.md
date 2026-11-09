@@ -37,12 +37,13 @@
 
 选择 `tailscale` 时，目标机器需要已连通同一 Tailscale 网络；选择 `public` 时，Hub endpoint 需要由公网或 NAT 环境提供可达性。脚本只使用命令中提供的 endpoint，不调用 Tailscale 管理 API。
 
-macOS 仅安装 WireGuard.app 不满足脚本所需的命令行管理接口；脚本需要
-`wireguard-tools` 和 `wireguard-go` 提供的 `wg`、`wg-quick`、`wireguard-go`。
-Homebrew 不是 macOS 的系统默认组件；如果目标机没有 Homebrew，脚本会直接停止并
-提示先手动准备 WireGuard 命令行工具，不会替用户安装 Homebrew。Windows 同理，
-`winget.exe` 不是所有 Windows 镜像都保证存在；缺少它时脚本会提示手动安装
-WireGuard for Windows 或 App Installer/WinGet。
+macOS 脚本需要命令行中的 `wg`、`wg-quick` 和 `wireguard-go`；仅安装
+WireGuard.app 不保证这些命令已经出现在当前 shell 的 `PATH` 中。Homebrew
+不是 macOS 的系统默认组件；如果目标机没有 Homebrew，脚本会直接停止并提示
+先手动准备 WireGuard 命令行工具，不会替用户安装 Homebrew。
+Windows 同理，`winget.exe`
+不是所有 Windows 镜像都保证存在；缺少它时脚本会提示手动安装 WireGuard for
+Windows 或 App Installer/WinGet。
 
 ## 命令接口
 
